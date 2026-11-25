@@ -1,53 +1,74 @@
-// Keyboard and pointer input. Held keys give a steering direction; one-shot presses (start or
-// restart, pause) are queued as bit flags and taken once by the loop, so a press between two
-// frames is never lost and never counted twice.
+// input.js — mouse and keyboard, translated into game actions.
+// The canvas is a fixed 1280x720 logical surface scaled by CSS, so every
+// pointer event is converted back into logical coordinates before hit-testing.
+// This file knows nothing about scoring or orders; it only calls the handlers
+// main.js hands it.
 
-export const ACTION_CONFIRM = 1;
-export const ACTION_PAUSE = 2;
+import { hitTest } from './render-kitchen.js';
+import { PANTRY_ORDER } from './recipes.js';
 
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
+export function logicalPosition(canvas, clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((clientX - rect.left) / rect.width) * 1280,
+    y: ((clientY - rect.top) / rect.height) * 720,
+  };
+}
 
-export function createInput(target) {
-  let left = false;
-  let right = false;
-  let actions = 0;
+export function attachInput(canvas, layout, handlers) {
+  const state = { mouse: { x: -100, y: -100 } };
+
+  canvas.addEventListener('mousemove', (event) => {
+    const pos = logicalPosition(canvas, event.clientX, event.clientY);
+    state.mouse.x = pos.x;
+    state.mouse.y = pos.y;
+    if (handlers.onMouseMove) handlers.onMouseMove(pos);
+  });
+
+  canvas.addEventListener('mouseleave', () => {
+    state.mouse.x = -100;
+    state.mouse.y = -100;
+  });
+
+  canvas.addEventListener('click', (event) => {
+    const pos = logicalPosition(canvas, event.clientX, event.clientY);
+    state.mouse.x = pos.x;
+    state.mouse.y = pos.y;
+    const hit = hitTest(layout, pos.x, pos.y, handlers.getScreen?.() ?? 'playing');
+    if (!hit) {
+      if (handlers.onEmptyClick) handlers.onEmptyClick(pos);
+      return;
+    }
+    switch (hit.type) {
+      case 'bin': handlers.onBin?.(hit.id); break;
+      case 'station': handlers.onStation?.(hit.kind); break;
+      case 'plate': handlers.onPlate?.(hit.index); break;
+      case 'trash': handlers.onTrash?.(); break;
+      case 'pause': handlers.onPause?.(); break;
+      case 'mute': handlers.onMute?.(); break;
+      case 'start': handlers.onStart?.(); break;
+      case 'next': handlers.onNext?.(); break;
+      case 'retry': handlers.onRetry?.(); break;
+      default: break;
+    }
+  });
 
   window.addEventListener('keydown', (event) => {
-    if (LEFT.has(event.code)) left = true;
-    else if (RIGHT.has(event.code)) right = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else return;
-    event.preventDefault();
-  });
-  window.addEventListener('keyup', (event) => {
-    if (LEFT.has(event.code)) left = false;
-    else if (RIGHT.has(event.code)) right = false;
-  });
-  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
-  window.addEventListener('blur', () => {
-    left = false;
-    right = false;
-  });
-  target.addEventListener('pointerdown', () => {
-    actions |= ACTION_CONFIRM;
+    if (event.repeat) return;
+    const key = event.key.toLowerCase();
+    if (key >= '1' && key <= '9') {
+      const id = PANTRY_ORDER[Number(key) - 1];
+      if (id) handlers.onBin?.(id);
+      return;
+    }
+    switch (key) {
+      case 't': handlers.onTrash?.(); break;
+      case 'p': case 'escape': handlers.onPause?.(); break;
+      case 'm': handlers.onMute?.(); break;
+      case 'enter': case ' ': handlers.onConfirm?.(); break;
+      default: break;
+    }
   });
 
-  return {
-    /** -1 for left, 1 for right, 0 for neither or both. */
-    direction() {
-      return (right ? 1 : 0) - (left ? 1 : 0);
-    },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
-    takeActions() {
-      const taken = actions;
-      actions = 0;
-      return taken;
-    },
-  };
+  return state;
 }

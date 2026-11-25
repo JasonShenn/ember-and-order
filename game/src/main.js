@@ -1,134 +1,323 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+// main.js — Ember & Order: boots the game, owns the loop and every player action.
+// The rules live in the small modules; this file wires them together:
+// grab -> process -> plate -> serve, plus the level clock, rush hour and screens.
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+import { createOrderBoard, tickOrderBoard, findMatchingOrder, activeOrders } from './orders.js';
+import { createStations, placeOnStation, takeFromStation, tickStations, stationAccepts } from './cooking-stations.js';
+import { createPlates, addToPlate, takeFromPlate, clearPlate, plateWants, plateMatchesRecipe } from './plating.js';
+import { createScore, scoreServe, scoreExpired, scoreBurnt } from './scoring.js';
+import { levelDef, isRushHour, starsForScore } from './levels.js';
+import { RECIPE_LIST, INGREDIENTS } from './recipes.js';
+import { computeLayout, drawGame, spawnSparkle, spawnFloater } from './render-kitchen.js';
+import { attachInput } from './input.js';
+import { sfx, setMuted, unlockAudio, startSizzle, stopSizzle } from './audio.js';
+import { seedDemo } from './demo.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const ctx = canvas.getContext('2d');
+const layout = computeLayout();
+const statusEl = document.getElementById('status');
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+function fitCanvas() {
+  const scale = Math.min(window.innerWidth / 1280, window.innerHeight / 720);
+  canvas.style.width = `${Math.floor(1280 * scale)}px`;
+  canvas.style.height = `${Math.floor(720 * scale)}px`;
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+function freshState(level) {
+  const def = levelDef(level);
+  return {
+    screen: 'title',
+    level,
+    levelTimeLeft: def.duration,
+    elapsed: 0,
+    board: createOrderBoard(level),
+    stations: createStations(),
+    plates: createPlates(),
+    hand: null,
+    score: createScore(),
+    rush: false,
+    paused: false,
+    frozen: false,
+    muted: false,
+    particles: [],
+    floaters: [],
+    mouse: { x: -100, y: -100 },
+    lastStars: 0,
+    gameOverReason: '',
+  };
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+let state = freshState(1);
+
+// Demo mode (?demo=cover|cooking|serving|rush): frozen showcase state for screenshots.
+const demoKind = new URLSearchParams(window.location.search).get('demo');
+if (demoKind) {
+  state = seedDemo(demoKind);
+  state.elapsed = 0;
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
+function startLevel(level) {
+  const keepScore = state.score;
+  state = freshState(level);
+  state.score = keepScore;
+  state.score.earnedThisLevel = 0;
+  state.screen = 'playing';
+  announce(`第 ${level} 夜开始：出 ${levelDef(level).quota} 单`);
 }
 
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
+function announce(msg) {
+  if (statusEl) statusEl.textContent = msg;
+}
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
+function platePosition(index) {
+  const p = layout.plates[index];
+  return { x: p.x, y: p.y - p.r - 10 };
+}
 
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+// Can this plate still become a real dish if we add this item?
+function plateCouldBecome(plate, ingredientId) {
+  const contents = [...plate.items, ingredientId];
+  return RECIPE_LIST.some((recipe) => {
+    const remaining = [...recipe.items];
+    for (const item of contents) {
+      const i = remaining.indexOf(item);
+      if (i < 0) return false;
+      remaining.splice(i, 1);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
+    return true;
+  });
+}
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
+const handlers = {
+  getScreen() {
+    return state.screen;
+  },
 
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+  onMouseMove(pos) {
+    state.mouse.x = pos.x;
+    state.mouse.y = pos.y;
+  },
+
+  onBin(id) {
+    if (state.screen !== 'playing' || state.paused || state.frozen) return;
+    unlockAudio();
+    if (state.hand) { sfx.error(); return; }
+    state.hand = id;
+    sfx.pickup();
+  },
+
+  onStation(kind) {
+    if (state.screen !== 'playing' || state.paused || state.frozen) return;
+    unlockAudio();
+    const st = state.stations.find((s) => s.kind === kind);
+    if (!st) return;
+    if (state.hand) {
+      if (stationAccepts(st, state.hand)) {
+        placeOnStation(st, state.hand);
+        state.hand = null;
+        sfx.place();
+      } else {
+        sfx.error();
+        const pos = layout.stations.find((r) => r.kind === kind);
+        spawnFloater(state, pos.x + pos.w / 2, pos.y + 30, st.state === 'empty' ? '这里不加工它' : '已经有东西在做了', '#ff8a80', 14);
+      }
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
+    const taken = takeFromStation(st);
+    if (taken) {
+      state.hand = taken;
+      if (taken === 'burnt') {
+        scoreBurnt(state.score);
+        sfx.burnt();
+        spawnFloater(state, st === state.stations[0] ? 400 : 600, 240, '烧焦了！快扔掉', '#ff8a80', 16);
+      } else {
+        sfx.pickup();
       }
-    } else {
-      accumulator = 0;
+    } else if (st.state === 'working') {
+      sfx.error();
+      const pos = layout.stations.find((r) => r.kind === kind);
+      spawnFloater(state, pos.x + pos.w / 2, pos.y + 30, '还没好，再等一下', '#ffd9a0', 14);
     }
-    renderer.draw(world.state, screen, best);
-  }
+  },
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
+  onPlate(index) {
+    if (state.screen !== 'playing' || state.paused || state.frozen) return;
+    unlockAudio();
+    const plate = state.plates[index];
+    if (state.hand) {
+      const handId = state.hand;
+      if (plate.items.length >= 4) { sfx.error(); return; }
+      if (!plateCouldBecome(plate, handId) && !plateWants(plate, handId, state.board.orders)) {
+        sfx.error();
+        const pos = platePosition(index);
+        spawnFloater(state, pos.x, pos.y, '这道菜不需要它', '#ff8a80', 14);
+        return;
+      }
+      addToPlate(plate, handId);
+      state.hand = null;
+      sfx.place();
+      return;
     }
-  });
+    // Empty hand: serve a finished plate, or take the last item back.
+    const recipe = plateMatchesRecipe(plate, RECIPE_LIST);
+    if (recipe) {
+      const order = findMatchingOrder(state.board, plate.items);
+      if (order) {
+        servePlate(index, order, recipe);
+        return;
+      }
+      sfx.error();
+      const pos = platePosition(index);
+      spawnFloater(state, pos.x, pos.y, '还没人点这道菜', '#ffd9a0', 14);
+      return;
+    }
+    if (plate.items.length > 0) {
+      state.hand = takeFromPlate(plate);
+      sfx.pickup();
+    }
+  },
 
-  announce('Block Dodger. Press Space or click to start.');
-  requestAnimationFrame(frame);
+  onTrash() {
+    if (state.screen !== 'playing' || state.paused || state.frozen) return;
+    if (!state.hand) return;
+    const wasBurnt = state.hand === 'burnt';
+    state.hand = null;
+    sfx.place();
+    if (wasBurnt) spawnFloater(state, 924, 500, '扔掉了', '#c9a37a', 14);
+  },
+
+  onPause() {
+    if (state.screen === 'playing') {
+      state.paused = !state.paused;
+      sfx.click();
+    }
+  },
+
+  onMute() {
+    state.muted = !state.muted;
+    setMuted(state.muted);
+    sfx.click();
+  },
+
+  onStart() {
+    if (state.screen !== 'title') return;
+    unlockAudio();
+    sfx.bell();
+    startLevel(1);
+  },
+
+  onNext() {
+    if (state.screen !== 'levelComplete') return;
+    unlockAudio();
+    sfx.bell();
+    startLevel(state.level + 1);
+  },
+
+  onRetry() {
+    if (state.screen !== 'gameOver' && state.screen !== 'win') return;
+    unlockAudio();
+    sfx.bell();
+    state.score = createScore();
+    startLevel(1);
+  },
+
+  onConfirm() {
+    if (state.screen === 'title') handlers.onStart();
+    else if (state.screen === 'levelComplete') handlers.onNext();
+    else if (state.screen === 'gameOver' || state.screen === 'win') handlers.onRetry();
+  },
+
+  onEmptyClick() { /* clicking empty counter space does nothing */ },
+};
+
+function servePlate(index, order, recipe) {
+  const plate = state.plates[index];
+  const result = scoreServe(state.score, order, state.rush);
+  order.state = 'served';
+  state.board.servedThisLevel += 1;
+  clearPlate(plate);
+  plate.flash = 1;
+  const pos = platePosition(index);
+  spawnSparkle(state, layout.plates[index].x, layout.plates[index].y);
+  spawnFloater(state, pos.x, pos.y, `+¥${result.earned}`, '#ffd94d', 24);
+  spawnFloater(state, pos.x, pos.y + 26, `小费 ¥${result.tip} · 连击 x${result.combo}`, '#fff2dd', 14);
+  sfx.serve();
+  announce(`出菜：${recipe.name}，收入 ¥${result.earned}`);
 }
 
-if (shot) runShot(shot);
-else runGame();
+attachInput(canvas, layout, handlers);
+
+// ---------------------------------------------------------------- game loop
+
+let lastNow = performance.now();
+
+function frame(now) {
+  // Re-register first: one bad frame must never freeze the game.
+  requestAnimationFrame(frame);
+  const rawDt = Math.min(0.05, (now - lastNow) / 1000);
+  lastNow = now;
+  state.elapsed += rawDt;
+
+  if (state.screen === 'playing' && !state.paused && !state.frozen) {
+    const dt = rawDt;
+    state.levelTimeLeft -= dt;
+    state.rush = isRushHour(state.level, state.levelTimeLeft);
+
+    const before = activeOrders(state.board).length;
+    const { expired } = tickOrderBoard(state.board, dt, state.levelTimeLeft);
+    if (activeOrders(state.board).length > before) sfx.ticket();
+    for (const order of expired) {
+      const penalty = scoreExpired(state.score);
+      spawnFloater(state, 640, 110, `客人走了 -¥${penalty}`, '#ff8a80', 18);
+      sfx.error();
+      announce(`订单超时：${order.dishName} 的客人走了`);
+    }
+
+    for (const event of tickStations(state.stations, dt)) {
+      if (event.type === 'station-done') {
+        sfx.done();
+        const rect = layout.stations.find((r) => r.kind === event.station.kind);
+        spawnFloater(state, rect.x + rect.w / 2, rect.y + 30, '好了！', '#9be15d', 16);
+      } else if (event.type === 'station-burnt') {
+        scoreBurnt(state.score);
+        sfx.burnt();
+      }
+    }
+
+    const anyWorking = state.stations.some((s) => s.state === 'working');
+    if (anyWorking) startSizzle();
+    else stopSizzle();
+
+    // Level ends: quota met, or the clock ran out.
+    const def = levelDef(state.level);
+    if (state.board.servedThisLevel >= def.quota) {
+      state.lastStars = starsForScore(state.level, state.score.earnedThisLevel);
+      stopSizzle();
+      sfx.levelClear();
+      state.screen = state.level >= 3 ? 'win' : 'levelComplete';
+      announce(state.screen === 'win' ? '三夜全满贯！' : `第 ${state.level} 夜完成`);
+    } else if (state.levelTimeLeft <= 0) {
+      state.levelTimeLeft = 0;
+      state.gameOverReason = `时间到，只出了 ${state.board.servedThisLevel}/${def.quota} 单。`;
+      stopSizzle();
+      sfx.gameOver();
+      state.screen = 'gameOver';
+      announce('打烊了：时间到');
+    }
+  }
+
+  drawGame(ctx, state, layout, state.frozen ? 0 : rawDt);
+}
+
+requestAnimationFrame(frame);
+
+// Expose a tiny debug handle so automated play-tests can drive the game.
+window.__emberAndOrder = {
+  get state() { return state; },
+  startLevel,
+  handlers,
+  layout,
+};
